@@ -35,7 +35,10 @@ RUN pip install \
     matplotlib \
     ipykernel \
     opencv-python \
-    scikit-learn
+    scikit-learn \
+    albumentations \
+    transformers \
+    evaluate
 
 RUN apt install -y \
     libgl1-mesa-glx 

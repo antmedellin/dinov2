@@ -2,16 +2,16 @@
 
     "image" : "dino2_docker",
 
-    // "mounts":[
-    //     "source=${localWorkspaceFolder}/../sample_data,target=/workspace,type=bind,consistency=cached"
-    // ],
+    "mounts":[
+        "source=${localWorkspaceFolder}/../freiburg_forest_annotated,target=/workspaces/freiburg_forest_annotated,type=bind,consistency=cached"
+    ],
 
     "runArgs":[
 
         "--gpus=all",
         "-e", "HOST_UID=$(id -u)",
         "-e", "HOST_GID=$(id -g)",
-        // "--shm-size=1g",
+        "--shm-size=8g",
     ],
 
     "customizations": {
