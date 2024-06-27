@@ -41,7 +41,8 @@ RUN pip install \
     evaluate
 
 RUN apt install -y \
-    libgl1-mesa-glx 
+    libgl1-mesa-glx \
+    gdal-bin 
 
 RUN useradd -m dino_user 
 

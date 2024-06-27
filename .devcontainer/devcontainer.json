@@ -3,7 +3,7 @@
     "image" : "dino2_docker",
 
     "mounts":[
-        "source=${localWorkspaceFolder}/../freiburg_forest_annotated,target=/workspaces/freiburg_forest_annotated,type=bind,consistency=cached"
+        "source=${localWorkspaceFolder}/../../HyperWorkspace/HyperImages/LIB-HSI,target=/workspaces/LIB-HSI,type=bind,consistency=cached"
     ],
 
     "runArgs":[
