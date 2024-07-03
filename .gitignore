@@ -9,3 +9,7 @@ dist/
 *.swp
 
 .vscode/
+
+**/output/*
+**/model/*
+**/results/*

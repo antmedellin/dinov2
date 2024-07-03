@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  app:
+    image: dino2_docker
+    environment:
+      HOST_UID: $(id -u)
+      HOST_GID: $(id -g)
+    volumes:
+      - type: bind
+        source: ./../../HyperWorkspace/HyperImages/LIB-HSI
+        target: /workspaces/LIB-HSI
+        consistency: cached
+      - type: bind
+        source: ./
+        target: /workspaces/dinov2
+        consistency: cached
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+    shm_size: 8g
+    command: sudo /usr/bin/python3 /workspaces/dinov2/notebooks/hsi_semantic_segmentation.py
