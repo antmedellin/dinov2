@@ -18,6 +18,13 @@ import evaluate
 from torch.optim import AdamW
 from tqdm.auto import tqdm
 from PIL import Image
+import builtins
+import functools
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 
 def extract_rgb(cube, red_layer=70 , green_layer=53, blue_layer=19):
@@ -170,6 +177,25 @@ class SegmentationDataset(Dataset):
         return hsi_img, rgb_img, label_img_greyscale
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2, ignore_index=None, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', ignore_index=self.ignore_index)
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:  # 'none'
+            return focal_loss
 
 def collate_fn(inputs):
 
@@ -386,6 +412,12 @@ class CombinedClassifier(torch.nn.Module):
         rgb_logits = self.rgb_classifier(rgb_embeddings)
         
         hsi_embeddings = self.hsi_model(hsi_pixel_values)
+        
+        if hsi_embeddings.shape[0] == 1:
+            hsi_embeddings = hsi_embeddings.squeeze(0)
+        hsi_embeddings = hsi_embeddings.transpose(0,1)
+        
+        
         hsi_logits = self.hsi_classifier(hsi_embeddings)
         
         # print(rgb_logits.shape, hsi_logits.shape, rgb_embeddings.shape, hsi_embeddings.shape)
@@ -411,7 +443,9 @@ class CombinedClassifier(torch.nn.Module):
         if labels is not None:
             # important: we're going to use 0 here as ignore index 
             # as we don't want the model to learn to predict background
-            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+            # loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+            loss_fct = FocalLoss(ignore_index=ignore_index)
+
             rgb_loss = loss_fct(rgb_logits, labels)
             hsi_loss = loss_fct(hsi_logits, labels)
             combined_loss = loss_fct(combined_logits, labels)
@@ -439,6 +473,18 @@ class CombinedClassifier(torch.nn.Module):
         if labels is not None:
             labels = labels.to(self.device)
         return self.forward(hsi_pixel_values=hsi_pixel_values, rgb_pixel_values=rgb_pixel_values, labels=labels)        
+
+
+# Function to update learning rate
+def update_learning_rate(optimizer, epoch, warmup_lr, base_lr, num_warmup_epochs):
+    if epoch < num_warmup_epochs:
+        # Linear warm-up
+        lr = warmup_lr + (base_lr - warmup_lr) * (epoch / num_warmup_epochs)
+    else:
+        lr = base_lr  # Keep constant after warm-up, or implement your schedule
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
         
 #clear cuda memory
 torch.cuda.empty_cache()
@@ -450,17 +496,28 @@ dataset_dir = "/workspaces/LIB-HSI"
 rgb_data_json = '/workspaces/dinov2/notebooks/lib_hsi_rgb.json'
 output_dir = "/workspaces/dinov2/output"
 
-learning_rate = 5e-5
-epochs = 1
+
+epochs = 50
+num_warmup_epochs = 5
 batch_size = 1
 num_workers = 4
 ignore_index=-1
+
+initial_lr = 0.0001  # Initial learning rate for warm-up
+base_lr = 0.001  # Learning rate after warm-up
+warmup_lr = initial_lr
+
+early_stopping_patience = 5
+
+
+
 
 base_transform = A.Compose([
     A.Resize(width=448, height=448),
 ])
 
-
+# Redefine the print function to automatically flush by default
+builtins.print = functools.partial(print, flush=True)
 
 file_data =  open(rgb_data_json)
 file_contents = json.load(file_data)
@@ -502,10 +559,10 @@ model = CombinedClassifier(num_labels = num_classes, repo_name=REPO_NAME, model_
 
 #initialize metrics for model
 metric = evaluate.load("mean_iou")
-metric_test = evaluate.load("mean_iou")
+metric_val = evaluate.load("mean_iou")
 
 # set optimizer
-optimizer = AdamW(model.parameters(), lr=learning_rate)
+optimizer = AdamW(model.parameters(), lr=initial_lr)
 
 # set device for processing and move model to device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -516,17 +573,20 @@ print("using" , device)
 # initialize empty data stuctures to keep track of learning performance
 
 history_loss_train = []
-history_loss_test = []
+history_loss_val = []
 
 history_mean_iou_train = []
-history_mean_iou_test = []
+history_mean_iou_val = []
 
 history_mean_accuracy_train = []
-history_mean_accuracy_test = []
+history_mean_accuracy_val = []
 
 highest_accuracy = 0
 lowest_loss = 1000000
 highest_iou = 0
+epochs_since_improvement = 0
+early_stop = False
+best_score = float('inf')
 
 
 # Create a directory to save the best models
@@ -539,9 +599,19 @@ if not os.path.exists(model_directory):
     os.makedirs(model_directory)
    
 
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, verbose=True)
+
+
+
 # start training
 for epoch in range(epochs):
-    print("Epoch:", epoch+1)
+    # print("Epoch:", epoch+1)
+    current_lr = update_learning_rate(optimizer, epoch, warmup_lr, base_lr, num_warmup_epochs)
+    
+    if epoch > num_warmup_epochs:
+        scheduler.step(history_loss_val[-1])
+    print(f"Epoch: {epoch+1}, Learning Rate: {current_lr}")
+    
     model.train()
     for idx, batch in enumerate(tqdm(train_dataloader)):
         torch.cuda.synchronize()
@@ -582,6 +652,8 @@ for epoch in range(epochs):
     history_mean_accuracy_train.append(metrics["mean_accuracy"])
     
     model.eval()
+    val_loss_accumulated = 0  # Initialize variable to accumulate validation loss
+
     for idx, batch in enumerate(tqdm(val_dataloader)):
         # pixel_values = batch["rgb_pixel_values"].to(device)
         # pixel_values = batch["hsi_pixel_values"].to(device)
@@ -594,40 +666,53 @@ for epoch in range(epochs):
         # forward pass
         # outputs = model(pixel_values, labels=labels)
         outputs = model(hsi_pixel_values, rgb_pixel_values, labels=labels)
-        test_loss = outputs.loss
+        val_loss = outputs.loss
+        val_loss_accumulated += val_loss.item()  
 
         with torch.no_grad():
             predicted = outputs.logits.argmax(dim=1)
 
             # note that the metric expects predictions + labels as numpy arrays
             
-            metric_test.add_batch(predictions=predicted.detach().cpu().numpy(), references=labels.detach().cpu().numpy())
+            metric_val.add_batch(predictions=predicted.detach().cpu().numpy(), references=labels.detach().cpu().numpy())
+   
+    average_val_loss = val_loss_accumulated / len(val_dataloader)
 
-    metrics_test = metric_test.compute(num_labels=num_classes,
+    metrics_val = metric_val.compute(num_labels=num_classes,
                             ignore_index=ignore_index,
                             reduce_labels=False,
     )
-    history_loss_test.append(test_loss.item())
-    history_mean_iou_test.append(metrics_test["mean_iou"])
-    history_mean_accuracy_test.append(metrics_test["mean_accuracy"])
+    history_loss_val.append(average_val_loss)
+    history_mean_iou_val.append(metrics_val["mean_iou"])
+    history_mean_accuracy_val.append(metrics_val["mean_accuracy"])
     
-    print("Train Loss: ", loss.item(), " Test Loss: ", test_loss.item())
-    print("Train Mean_iou: ", metrics["mean_iou"], " Test Mean_iou: ", metrics_test["mean_iou"])
-    print("Train Mean_accuracy: ", metrics["mean_accuracy"], " Test Mean_accuracy: ", metrics_test["mean_accuracy"])
+    print("Train Loss: ", loss.item(), " Validation Loss: ", average_val_loss)
+    print("Train Mean_iou: ", metrics["mean_iou"], " Validation Mean_iou: ", metrics_val["mean_iou"])
+    print("Train Mean_accuracy: ", metrics["mean_accuracy"], " Validation Mean_accuracy: ", metrics_val["mean_accuracy"])
     
     
-    if metrics_test["mean_accuracy"] > highest_accuracy:
-        highest_accuracy = metrics_test["mean_accuracy"]
+    if metrics_val["mean_accuracy"] > highest_accuracy:
+        highest_accuracy = metrics_val["mean_accuracy"]
         torch.save(model.state_dict(), os.path.join(model_directory, "highest_accuracy_model.pth"))
         
-    if test_loss.item() < lowest_loss:
-        lowest_loss = test_loss.item()
+    if average_val_loss < lowest_loss:
+        lowest_loss = average_val_loss
         torch.save(model.state_dict(), os.path.join(model_directory, "lowest_loss_model.pth"))
         
-    if metrics_test["mean_iou"] > highest_iou:
-        highest_iou = metrics_test["mean_iou"]
+    if metrics_val["mean_iou"] > highest_iou:
+        highest_iou = metrics_val["mean_iou"]
         torch.save(model.state_dict(), os.path.join(model_directory, "highest_iou_model.pth"))
-
+        
+    if average_val_loss < best_score:
+        best_score = average_val_loss
+        epochs_since_improvement = 0
+    else:
+        epochs_since_improvement += 1
+        if epochs_since_improvement == early_stopping_patience:
+            print("Early stopping")
+            break
+if not early_stop:
+    print("Completed all epochs without early stopping.")
 
 
 result_directory = os.path.join(output_dir, "results")
