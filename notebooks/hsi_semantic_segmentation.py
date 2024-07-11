@@ -21,10 +21,9 @@ from PIL import Image
 import builtins
 import functools
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-
+import sys
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 
 def extract_rgb(cube, red_layer=70 , green_layer=53, blue_layer=19):
@@ -348,6 +347,226 @@ class HSIClassifier(torch.nn.Module):
             loss=loss,
             logits=logits
         )
+# combined hsi and rgb model
+class HSItestClassifier(torch.nn.Module):
+    def __init__(self,  num_labels=1, device="cuda"):
+        super(HSItestClassifier, self).__init__()
+        
+        self.device = device     
+            
+        self.hsi_classifier = LinearClassifierNew(768, 32, 32, num_labels)
+        self.hsi_classifier = self.hsi_classifier.to(self.device)
+        
+        self.hsi_model =  torch.nn.Sequential(
+            
+            torch.nn.Conv2d(num_channels, 256, kernel_size=3, padding=1),  
+            torch.nn.LeakyReLU(),
+            torch.nn.MaxPool2d(2, 2),  #
+            torch.nn.Conv2d(256, 512, kernel_size=3, padding=2),
+            torch.nn.LeakyReLU(),
+            torch.nn.MaxPool2d(2, 2),  
+            torch.nn.Conv2d(512, 768, kernel_size=3, padding=2),  
+            torch.nn.LeakyReLU(),
+            torch.nn.Conv2d(768, 768, kernel_size=3, stride=2, padding=2),  
+            torch.nn.LeakyReLU(),
+            torch.nn.Conv2d(768, 768, kernel_size=3, stride=2, padding=3),  
+            torch.nn.Flatten(start_dim=2),
+            
+        )
+        
+        self.hsi_model_mlp =  torch.nn.Sequential(
+            #204 input channels, 448, 448 input size
+            torch.nn.Linear(204,512),
+            torch.nn.LeakyReLU(),
+            torch.nn.Dropout(0.15),
+            torch.nn.Linear(512,512),
+            torch.nn.LeakyReLU(),
+            torch.nn.Dropout(0.15),
+            torch.nn.Linear(512,512),
+            torch.nn.LeakyReLU(),
+            torch.nn.Dropout(0.15),
+            torch.nn.Linear(512,num_labels),
+            
+
+            
+        )
+        
+
+        
+    def forward(self, hsi_pixel_values, rgb_pixel_values, labels=None):
+        
+        
+        
+        # hsi_embeddings = self.hsi_model(hsi_pixel_values)
+        # if hsi_embeddings.shape[0] == 1:
+        #     hsi_embeddings = hsi_embeddings.squeeze(0)
+        # hsi_embeddings = hsi_embeddings.transpose(0,1)
+        # hsi_logits = self.hsi_classifier(hsi_embeddings)
+        
+        hsi_pixel_values = hsi_pixel_values.permute(0,2,3,1)
+        
+        hsi_logits = self.hsi_model_mlp(hsi_pixel_values)
+        # print(hsi_logits.shape, "hsi_logits shape")
+        
+        hsi_logits = hsi_logits.permute(0, 3, 1, 2)  # Now hsi_logits_permuted has shape [1, 45, 448, 448]
+
+        # hsi_logits2 = torch.nn.functional.interpolate(hsi_logits, size=hsi_pixel_values.shape[2:], mode="bilinear", align_corners=False)
+     
+        # print(hsi_logits.shape, "hsi_logits shape", labels.shape, "labels shape")
+
+     
+     
+     
+        hsi_loss = None
+        
+        if labels is not None:
+            # important: we're going to use 0 here as ignore index 
+            # as we don't want the model to learn to predict background
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+            # loss_fct = FocalLoss(ignore_index=ignore_index)
+
+            hsi_loss = loss_fct(hsi_logits, labels)
+           
+
+            
+            return  SemanticSegmenterOutput(
+                
+                loss= hsi_loss  ,
+                logits=hsi_logits
+            )
+        else:
+            return  SemanticSegmenterOutput(
+                loss= hsi_loss ,
+                logits=hsi_logits
+            )
+        
+    
+        
+        
+    def __call__(self, hsi_pixel_values, rgb_pixel_values,  labels=None):
+        hsi_pixel_values = hsi_pixel_values.to(self.device)
+
+        if labels is not None:
+            labels = labels.to(self.device)
+        return self.forward(hsi_pixel_values=hsi_pixel_values, rgb_pixel_values=rgb_pixel_values, labels=labels)        
+ 
+# combined hsi and rgb model
+class RGBclassifier(torch.nn.Module):
+    def __init__(self,  num_labels=1, repo_name="facebookresearch/dinov2", model_name="dinov2_vitb14_reg",   half_precision=False, device="cuda"):
+        super(RGBclassifier, self).__init__()
+        
+        self.device = device     
+        
+        self.repo_name = repo_name
+        self.model_name = model_name
+        self.half_precision = half_precision
+        self.device = device
+        
+        # load the dinov2 model 
+        if self.half_precision:
+            self.rgb_model = torch.hub.load(repo_or_dir=repo_name, model=model_name).half().to(self.device)
+        else:
+            self.rgb_model= torch.hub.load(repo_or_dir=repo_name, model=model_name).to(self.device)
+            
+        # Get the parameters of the last layer
+        last_layer_params = list(self.rgb_model.parameters())[-1]
+        # get the patch descriptor size for use in initializing the linear classifier layer 
+        patch_descriptor_size = last_layer_params.shape[0]    
+        
+        # Freeze the DINOv2 model. This allows for faster training. 
+        for _, param in self.rgb_model.named_parameters():
+            param.requires_grad = False
+            
+        
+        self.rgb_classifier = torch.nn.Sequential(
+            #204 input channels, 448, 448 input size
+            torch.nn.Linear(768,768),
+            torch.nn.LeakyReLU(),
+            torch.nn.Dropout(0.15),
+            torch.nn.Linear(768,768),
+            torch.nn.LeakyReLU(),
+            torch.nn.Dropout(0.15),
+            torch.nn.Linear(768,512),
+            torch.nn.LeakyReLU(),
+            torch.nn.Dropout(0.15),
+            torch.nn.Linear(512,num_labels),
+        )
+        
+        
+        self.rgb_classifier = self.rgb_classifier.to(self.device)
+        
+        
+        self.classifier = torch.nn.Sequential(
+                    torch.nn.Conv2d(768, 512, (1,1)),
+                    torch.nn.LeakyReLU(),
+                    torch.nn.Conv2d(512, 256, (1,1)),
+                    torch.nn.LeakyReLU(),
+                    torch.nn.Conv2d(256, 128, (1,1)),
+                    torch.nn.LeakyReLU(),
+                    torch.nn.Conv2d(128, 64, (1,1)),
+                    torch.nn.LeakyReLU(),
+                    torch.nn.Conv2d(64, num_labels, (1,1))
+
+
+
+        )
+        
+        
+        self.classifier = self.classifier.to(self.device)
+        
+        
+        
+        
+        self.num_labels = num_labels
+
+        
+    def forward(self, hsi_pixel_values, rgb_pixel_values, labels=None):
+        
+        
+        rgb_embeddings = self.rgb_model.get_intermediate_layers(rgb_pixel_values)[0].squeeze()
+        
+        
+        # rgb_logits = self.rgb_classifier(rgb_embeddings)
+        # rgb_logits.transpose(0,1)
+        # rgb_logits = rgb_logits.reshape(1, self.num_labels, 32,32)
+        
+        rgb_embeddings = rgb_embeddings.reshape(-1, 32,32, 768)
+        rgb_embeddings = rgb_embeddings.permute(0,3,1,2)
+        
+        rgb_embeddings = torch.nn.functional.interpolate(rgb_embeddings, size=hsi_pixel_values.shape[2:], mode="bilinear", align_corners=False)
+        
+        rgb_logits = self.classifier(rgb_embeddings)
+        
+        
+        # print(rgb_logits.shape, "rgb_logits shape", rgb_embeddings.shape, "rgb_embeddings shape")
+        # loss of rgb and hsi logits
+        rgb_logits = torch.nn.functional.interpolate(rgb_logits, size=hsi_pixel_values.shape[2:], mode="bilinear", align_corners=False)
+        
+        
+        rgb_loss = None
+  
+        
+        if labels is not None:
+            # important: we're going to use 0 here as ignore index 
+            # as we don't want the model to learn to predict background
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+            # loss_fct = FocalLoss(ignore_index=ignore_index)
+
+            rgb_loss = loss_fct(rgb_logits, labels)
+ 
+            
+            return  SemanticSegmenterOutput(
+                
+                loss=rgb_loss , # combined loss is weighted more since it is the combined model and has the output logits
+                logits=rgb_logits
+            )
+        else:
+            return  SemanticSegmenterOutput(
+                loss=rgb_loss ,
+                logits=rgb_logits
+            )
+            
+            
                      
 # combined hsi and rgb model
 class CombinedClassifier(torch.nn.Module):
@@ -420,7 +639,7 @@ class CombinedClassifier(torch.nn.Module):
         
         hsi_logits = self.hsi_classifier(hsi_embeddings)
         
-        # print(rgb_logits.shape, hsi_logits.shape, rgb_embeddings.shape, hsi_embeddings.shape)
+        # # print(rgb_logits.shape, hsi_logits.shape, rgb_embeddings.shape, hsi_embeddings.shape)
         
         combined_embeddings = torch.cat([rgb_logits, hsi_logits], dim=1) # concatenate along the channel dimension so descriptors are combined
 
@@ -443,8 +662,8 @@ class CombinedClassifier(torch.nn.Module):
         if labels is not None:
             # important: we're going to use 0 here as ignore index 
             # as we don't want the model to learn to predict background
-            # loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
-            loss_fct = FocalLoss(ignore_index=ignore_index)
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+            # loss_fct = FocalLoss(ignore_index=ignore_index)
 
             rgb_loss = loss_fct(rgb_logits, labels)
             hsi_loss = loss_fct(hsi_logits, labels)
@@ -454,12 +673,12 @@ class CombinedClassifier(torch.nn.Module):
             
             return  SemanticSegmenterOutput(
                 
-                loss=rgb_loss+ hsi_loss + 2*combined_loss, # combined loss is weighted more since it is the combined model and has the output logits
+                loss=rgb_loss + hsi_loss + 2*combined_loss, # combined loss is weighted more since it is the combined model and has the output logits
                 logits=combined_logits
             )
         else:
             return  SemanticSegmenterOutput(
-                loss=combined_loss,
+                loss=rgb_loss + hsi_loss + 2*combined_loss,
                 logits=combined_logits
             )
         
@@ -500,16 +719,25 @@ output_dir = "/workspaces/dinov2/output"
 epochs = 50
 num_warmup_epochs = 5
 batch_size = 1
-num_workers = 4
+num_workers = 6
 ignore_index=-1
 
 initial_lr = 0.0001  # Initial learning rate for warm-up
 base_lr = 0.001  # Learning rate after warm-up
 warmup_lr = initial_lr
 
-early_stopping_patience = 5
+early_stopping_patience = 10
+early_stopping_min_epoch = 20
 
 
+train_transform = A.Compose([
+    
+    A.RandomCrop(width=400, height=400),  # Example of spatial augmentation
+    A.HorizontalFlip(p=0.5),  # Example of flip augmentation
+    # A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),  # Example of color augmentation
+    A.Rotate(limit=45, p=0.5), 
+    A.Resize(width=448, height=448),
+])
 
 
 base_transform = A.Compose([
@@ -533,7 +761,7 @@ print(id2color)
 num_classes = len(id2label)
 print("num classes",num_classes)
 
-train_dataset = SegmentationDataset(image_set="train", root_dir=dataset_dir, id2color=id2color, transform=base_transform)
+train_dataset = SegmentationDataset(image_set="train", root_dir=dataset_dir, id2color=id2color, transform=train_transform)
 
 test_dataset = SegmentationDataset(image_set="test", root_dir=dataset_dir, id2color=id2color,  transform=base_transform)
 
@@ -555,7 +783,15 @@ train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True
 val_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn,num_workers=num_workers)
 
 
-model = CombinedClassifier(num_labels = num_classes, repo_name=REPO_NAME, model_name=MODEL_NAME, half_precision=False, device="cuda")
+# model = DinoV2SemanticSegmentationRegisters(num_labels = num_classes, repo_name=REPO_NAME, model_name=MODEL_NAME, half_precision=False, device="cuda")  
+
+# model = CombinedClassifier(num_labels = num_classes, repo_name=REPO_NAME, model_name=MODEL_NAME, half_precision=False, device="cuda")
+
+# model = HSItestClassifier(num_labels = num_classes, device="cuda") 
+
+model = RGBclassifier(num_labels = num_classes, repo_name=REPO_NAME, model_name=MODEL_NAME, half_precision=False, device="cuda")
+
+
 
 #initialize metrics for model
 metric = evaluate.load("mean_iou")
@@ -581,12 +817,18 @@ history_mean_iou_val = []
 history_mean_accuracy_train = []
 history_mean_accuracy_val = []
 
+history_overall_accuracy_train = []
+history_overall_accuracy_val = []
+
 highest_accuracy = 0
 lowest_loss = 1000000
 highest_iou = 0
+highest_overall_accuracy = 0
 epochs_since_improvement = 0
 early_stop = False
-best_score = float('inf')
+# best_score = float('inf')
+best_score = 0
+
 
 
 # Create a directory to save the best models
@@ -599,7 +841,7 @@ if not os.path.exists(model_directory):
     os.makedirs(model_directory)
    
 
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, verbose=True)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
 
 
@@ -613,7 +855,7 @@ for epoch in range(epochs):
     print(f"Epoch: {epoch+1}, Learning Rate: {current_lr}")
     
     model.train()
-    for idx, batch in enumerate(tqdm(train_dataloader)):
+    for idx, batch in enumerate(tqdm(train_dataloader, file=sys.stdout)):
         torch.cuda.synchronize()
         # pixel_values = batch["rgb_pixel_values"].to(device)
         # pixel_values = batch["hsi_pixel_values"].to(device)
@@ -650,11 +892,12 @@ for epoch in range(epochs):
     history_loss_train.append(loss.item())
     history_mean_iou_train.append(metrics["mean_iou"])
     history_mean_accuracy_train.append(metrics["mean_accuracy"])
+    history_overall_accuracy_train.append(metrics["overall_accuracy"])
     
     model.eval()
     val_loss_accumulated = 0  # Initialize variable to accumulate validation loss
 
-    for idx, batch in enumerate(tqdm(val_dataloader)):
+    for idx, batch in enumerate(tqdm(val_dataloader, file=sys.stdout)):
         # pixel_values = batch["rgb_pixel_values"].to(device)
         # pixel_values = batch["hsi_pixel_values"].to(device)
         hsi_pixel_values = batch["hsi_pixel_values"].to(device)
@@ -685,10 +928,12 @@ for epoch in range(epochs):
     history_loss_val.append(average_val_loss)
     history_mean_iou_val.append(metrics_val["mean_iou"])
     history_mean_accuracy_val.append(metrics_val["mean_accuracy"])
+    history_overall_accuracy_train.append(metrics_val["overall_accuracy"])
     
     print("Train Loss: ", loss.item(), " Validation Loss: ", average_val_loss)
     print("Train Mean_iou: ", metrics["mean_iou"], " Validation Mean_iou: ", metrics_val["mean_iou"])
     print("Train Mean_accuracy: ", metrics["mean_accuracy"], " Validation Mean_accuracy: ", metrics_val["mean_accuracy"])
+    print("Train Overall_accuracy: ", metrics["overall_accuracy"], " Validation Overall_accuracy: ", metrics_val["overall_accuracy"])
     
     
     if metrics_val["mean_accuracy"] > highest_accuracy:
@@ -703,12 +948,18 @@ for epoch in range(epochs):
         highest_iou = metrics_val["mean_iou"]
         torch.save(model.state_dict(), os.path.join(model_directory, "highest_iou_model.pth"))
         
-    if average_val_loss < best_score:
+    if metrics_val["overall_accuracy"] > highest_overall_accuracy:
+        highest_overall_accuracy = metrics_val["overall_accuracy"]
+        torch.save(model.state_dict(), os.path.join(model_directory, "highest_overall_accuracy_model.pth"))
+        
+    if average_val_loss < best_score: # use loss as the metric to compare rather than accuracy
+    # if highest_accuracy > best_score: # use accuracy as the metric to compare rather than loss
         best_score = average_val_loss
+        # best_score = highest_accuracy
         epochs_since_improvement = 0
     else:
         epochs_since_improvement += 1
-        if epochs_since_improvement == early_stopping_patience:
+        if epochs_since_improvement == early_stopping_patience and epoch > early_stopping_min_epoch:
             print("Early stopping")
             break
 if not early_stop:
@@ -724,6 +975,8 @@ model.load_state_dict(torch.load(os.path.join(model_directory, "highest_accuracy
 model.to(device)
 model.eval()
 
+test_metrics = evaluate.load("mean_iou")
+
 for idx in range(test_dataset.__len__()):
 # for idx in range(test_dataset.__len__()):
     # in each directory save ground truth image, rgb image, and predicted image
@@ -737,9 +990,11 @@ for idx in range(test_dataset.__len__()):
     with torch.no_grad():
         outputs = model(hsi_pixel_values.to(device), rgb_pixel_values.to(device))
         
-    upsampled_logits = torch.nn.functional.interpolate(outputs.logits,
-                                                   size=(image.shape[-2], image.shape[-1]),
-                                                   mode="bilinear", align_corners=False)
+    test_metrics.add_batch(predictions=outputs.logits.argmax(dim=1).detach().cpu().numpy(), references=mask.unsqueeze(0).detach().cpu().numpy())
+    test_metrics.compute(num_labels=num_classes, ignore_index=ignore_index, reduce_labels=False)
+        
+    upsampled_logits = torch.nn.functional.interpolate(outputs.logits, size=(image.shape[-2], image.shape[-1]), mode="bilinear",align_corners=False)
+    
     predicted_map = upsampled_logits.argmax(dim=1)
     
     
@@ -775,6 +1030,6 @@ for idx in range(test_dataset.__len__()):
         
     
 
-
+print("Test Mean_iou: ", test_metrics["mean_iou"], " Test Mean_accuracy: ", test_metrics["mean_accuracy"], " Test Overall_accuracy: ", test_metrics["overall_accuracy"])
 
 print("finished")

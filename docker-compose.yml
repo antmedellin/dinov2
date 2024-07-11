@@ -6,6 +6,7 @@ services:
     environment:
       HOST_UID: $(id -u)
       HOST_GID: $(id -g)
+      PYTHONUNBUFFERED: 1  # Disable output buffering
     volumes:
       - type: bind
         source: ./../../HyperWorkspace/HyperImages/LIB-HSI
@@ -23,3 +24,5 @@ services:
               capabilities: [gpu]
     shm_size: 8g
     command: sudo /usr/bin/python3 /workspaces/dinov2/notebooks/hsi_semantic_segmentation.py
+    tty: true  # Enable TTY
+    stdin_open: true  # Keep stdin open
