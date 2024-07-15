@@ -13,7 +13,7 @@
         "--gpus=all",
         "-e", "HOST_UID=$(id -u)",
         "-e", "HOST_GID=$(id -g)",
-        "--shm-size=8g",
+        "--shm-size=16g",
     ],
 
     "customizations": {

@@ -8,7 +8,7 @@ import albumentations as A
 from PIL import Image
 import numpy as np
 import json
-from torchvision.transforms import ToTensor
+# from torchvision.transforms import ToTensor
 import matplotlib.pyplot as plt
 import cv2
 from osgeo import gdal
