@@ -13,3 +13,6 @@ dist/
 **/output/*
 **/model/*
 **/results/*
+
+**/freiburg_forest_annotated/*
+**/lightning_logs/*

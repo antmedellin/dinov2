@@ -718,8 +718,8 @@ output_dir = "/workspaces/dinov2/output"
 
 epochs = 50
 num_warmup_epochs = 5
-batch_size = 1
-num_workers = 6
+batch_size = 8
+num_workers = 8
 ignore_index=-1
 
 initial_lr = 0.0001  # Initial learning rate for warm-up
