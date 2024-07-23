@@ -5,7 +5,7 @@
     // this is similar to the docker compose file which can be used instead with: docker compose up
 
     "mounts":[
-        // "source=${localWorkspaceFolder}/../../HyperWorkspace/HyperImages/LIB-HSI,target=/workspaces/LIB-HSI,type=bind,consistency=cached"
+        "source=${localWorkspaceFolder}/../../HyperWorkspace/HyperImages/LIB-HSI,target=/workspaces/LIB-HSI,type=bind,consistency=cached"
     ],
 
     "runArgs":[
