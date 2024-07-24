@@ -1,6 +1,6 @@
 # build command  docker build -t dino2_docker .  
 
-FROM nvidia/cuda:12.5.0-devel-ubuntu22.04
+FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND noninteractive
 
@@ -43,6 +43,13 @@ RUN pip install \
 RUN apt install -y \
     libgl1-mesa-glx \
     gdal-bin 
+
+RUN pip install lightning tensorboard torch-tb-profiler pandas matplotlib seaborn 
+
+RUN pip install --upgrade torchmetrics
+
+RUN apt-get update && apt-get install -y python3-tk
+
 
 RUN useradd -m dino_user 
 

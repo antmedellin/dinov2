@@ -21,7 +21,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 import cv2
 import pandas as pd
 import matplotlib
-matplotlib.use('TkAgg')  # Use TkAgg for GUI-based environments
+# matplotlib.use('TkAgg')  # Use TkAgg for GUI-based environments
 import matplotlib.pyplot as plt  
 from osgeo import gdal
 import json
@@ -33,7 +33,9 @@ import seaborn as sns
 
 # tensorboard --logdir=./lightning_logs/
 # ctrl shft p -> Python: Launch Tensorboard  select lightning logs
-  
+import functools
+import builtins
+builtins.print = functools.partial(print, flush=True)  
 
 def extract_rgb(cube, red_layer=70 , green_layer=53, blue_layer=19):
 
@@ -281,10 +283,10 @@ class DinoV2SemanticSegmentation(L.LightningModule):
             else:
                 raise ValueError("step_type must be one of 'train', 'val', or 'test'")
             
-            self.log(f"{step_type}_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-            self.log(f"{step_type}_accuracy_overall", result_acc_overall, on_step=False, on_epoch=True, prog_bar=True)
-            self.log(f"{step_type}_accuracy_mean", results_acc_mean, on_step=False, on_epoch=True, prog_bar=True)
-            self.log(f"{step_type}_miou", result_miou, on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"{step_type}_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log(f"{step_type}_accuracy_overall", result_acc_overall, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log(f"{step_type}_accuracy_mean", results_acc_mean, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log(f"{step_type}_miou", result_miou, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
 
         
@@ -363,9 +365,9 @@ test_transform = A.Compose([
 
 dataset_dir='/workspaces/LIB-HSI'
 rgb_data_json = '/workspaces/dinov2/notebooks/lib_hsi_rgb.json'
-batch_size = 4
+batch_size = 20
 ignore_index=-1
-num_workers = 4 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
+num_workers =   os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
 initial_lr = 0.0001 
 
 file_data =  open(rgb_data_json)

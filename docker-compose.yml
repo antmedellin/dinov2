@@ -2,19 +2,23 @@ version: '3.8'
 
 services:
   app:
-    image: dino2_docker
+    image: dino2_docker_new
     environment:
       HOST_UID: $(id -u)
       HOST_GID: $(id -g)
       PYTHONUNBUFFERED: 1  # Disable output buffering
     volumes:
       - type: bind
-        source: ./../../HyperWorkspace/HyperImages/LIB-HSI
+        source: ./../HyperWorkspace/HyperImages/LIB-HSI
         target: /workspaces/LIB-HSI
         consistency: cached
       - type: bind
         source: ./
         target: /workspaces/dinov2
+        consistency: cached
+      - type: bind
+        source: ../lightning_logs
+        target: /home/lightning_logs
         consistency: cached
     deploy:
       resources:
@@ -22,7 +26,7 @@ services:
           devices:
             - driver: nvidia
               capabilities: [gpu]
-    shm_size: 8g
-    command: sudo /usr/bin/python3 /workspaces/dinov2/notebooks/hsi_semantic_segmentation.py
+    shm_size: 80g
+    command: sudo /usr/bin/python3 /workspaces/dinov2/notebooks/hsi_lightning.py
     tty: true  # Enable TTY
     stdin_open: true  # Keep stdin open
