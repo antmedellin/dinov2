@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 from osgeo import gdal
 import json
 import seaborn as sns
+import torchvision 
 
 # pip install lightning tensorboard torch-tb-profiler pandas matplotlib seaborn
 # pip install --upgrade torchmetrics
@@ -338,7 +339,270 @@ class DinoV2SemanticSegmentation(L.LightningModule):
             'optimizer': optimizer,
             "lr_scheduler": scheduler
              }
+ 
+class UNET_SemanticSegmentation(L.LightningModule):
+        def __init__(self, num_classes,repo_name="facebookresearch/dinov2", model_name="dinov2_vitb14_reg", half_precision=True , tokenW=64, tokenH=64, learning_rate = 1e-3, ignore_index=0 ,num_channels=204):
+            super().__init__()
+            
+            # load the dinov2 model 
+            if half_precision:
+                self.dinov2 = torch.hub.load(repo_or_dir=repo_name, model=model_name).half().to(self.device)
+            else:
+                self.dinov2= torch.hub.load(repo_or_dir=repo_name, model=model_name).to(self.device)
+                
+            last_layer_params = list(self.dinov2.parameters())[-1]
+            patch_descriptor_size = last_layer_params.shape[0]
+            
+            
+            # Freeze the DINOv2 model. This allows for faster training. 
+            for _, param in self.dinov2.named_parameters():
+                param.requires_grad = False
+            
+            self.classifier = torch.nn.Conv2d(patch_descriptor_size, num_classes, (1,1))
+           
+            
+            self.patch_descriptor_size = patch_descriptor_size
+            self.tokenW = tokenW
+            self.tokenH = tokenH
+            self.learning_rate = learning_rate
+            self.ignore_index = ignore_index
+           
+            
+            self.tokenW = tokenW
+            self.tokenH = tokenH
+            self.learning_rate = learning_rate
+            self.ignore_index = ignore_index
+            
+            
+            # performance metrics
+            self.loss_fn = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+            
+            self.train_miou = MeanIoU(num_classes=num_classes, per_class=False)
+            self.test_miou = MeanIoU(num_classes=num_classes, per_class=False)
+            self.val_miou = MeanIoU(num_classes=num_classes, per_class=False)
+            
+            self.train_confusion_matrix = MulticlassConfusionMatrix(num_classes=num_classes, normalize="true", ignore_index=ignore_index)
+            self.val_confusion_matrix = MulticlassConfusionMatrix(num_classes=num_classes, normalize="true", ignore_index=ignore_index)
+            self.test_confusion_matrix = MulticlassConfusionMatrix(num_classes=num_classes, normalize="true", ignore_index=ignore_index)
+            
+            #  Calculate statistics for each label and average them
+            self.train_acc_mean = MulticlassAccuracy(num_classes=num_classes, average="macro", ignore_index=ignore_index)
+            self.val_acc_mean = MulticlassAccuracy(num_classes=num_classes, average="macro", ignore_index=ignore_index)
+            self.test_acc_mean = MulticlassAccuracy(num_classes=num_classes, average="macro", ignore_index=ignore_index)
+            
+            #  Sum statistics over all labels
+            self.train_acc_overall = MulticlassAccuracy(num_classes=num_classes, average="micro", ignore_index=ignore_index)
+            self.val_acc_overall = MulticlassAccuracy(num_classes=num_classes, average="micro", ignore_index=ignore_index)
+            self.test_acc_overall = MulticlassAccuracy(num_classes=num_classes, average="micro", ignore_index=ignore_index)
+            
+            
+            # UNET 
+            #reference
+            # https://github.com/hamdaan19/UNet-Multiclass/blob/main/scripts/model.py
+            
+            # need to modify for dual input
+            self.layers = [num_channels, 64, 128, 256, 512, 1024] # use same architecute for 3/200 bands (if higher then it should help to remove some of the noise and take the most information from the bands)
+            
+            self.double_conv_downs = nn.ModuleList(
+            [self.__double_conv(layer, layer_n) for layer, layer_n in zip(self.layers[:-1], self.layers[1:])])
+            
+            self.up_trans = nn.ModuleList(
+                [nn.ConvTranspose2d(layer, layer_n, kernel_size=2, stride=2)
+                for layer, layer_n in zip(self.layers[::-1][:-2], self.layers[::-1][1:-1])])
+            self.double_conv_ups = nn.ModuleList(
+                [self.__double_conv(layer, layer//2) for layer in self.layers[::-1][:-2]])
+            self.max_pool_2x2 = nn.MaxPool2d(kernel_size=2, stride=2)
+            self.final_conv = nn.Conv2d(self.layers[1], num_classes, kernel_size=1)
+            
+            
+            self.fusion_classifier = torch.nn.Sequential(
+                nn.ConvTranspose2d(num_classes*2, int(num_classes*2*1.1), kernel_size=7, stride=2), # upsample kernel size 7  since dinov2 has a patch descriptor size of 14x14
+                nn.ReLU(),
+                nn.Conv2d(int(num_classes*2*1.1), num_classes, kernel_size=7, stride=2)
+            )
+            
+            
+            self.save_hyperparameters()
         
+        
+    
+        def forward(self, hsi_pixel_values, rgb_pixel_values):
+           
+
+            # test out unet without rgb right now so just hyperspectral 
+            concat_layers = []
+            x = hsi_pixel_values
+            
+            # down layers 
+            for down in self.double_conv_downs:
+                # x_new = self.adjust_channels(hsi_pixel_values) 
+                # print(1)
+                x = down(x)
+                # print(2)
+                if down != self.double_conv_downs[-1]:
+                    concat_layers.append(x)
+                    x = self.max_pool_2x2(x)
+        
+            concat_layers = concat_layers[::-1]
+            
+            # up layers 
+            for up_trans, double_conv_up, concat_layer  in zip(self.up_trans, self.double_conv_ups, concat_layers):
+                x = up_trans(x)
+                if x.shape != concat_layer.shape:
+                    x = torchvision.transforms.functional.resize(x, concat_layer.shape[2:])
+                
+                concatenated = torch.cat((concat_layer, x), dim=1)
+                x = double_conv_up(concatenated)
+                
+            x = self.final_conv(x)
+            
+            
+            assert not torch.isnan(rgb_pixel_values).any(), "NaN values in input pixel_values"            
+            embeddings = self.dinov2.get_intermediate_layers(rgb_pixel_values)[0].squeeze()
+            
+            assert not torch.isnan(embeddings).any(), "NaN values in embeddings"
+            
+            embeddings = embeddings.reshape(-1, self.tokenW, self.tokenH, self.patch_descriptor_size)
+            embeddings = embeddings.permute(0,3,1,2)
+        
+            assert not torch.isnan(embeddings).any(), "NaN values in embeddings"
+            
+            logits = self.classifier(embeddings)
+            # print( logits[0])
+            assert not torch.isnan(logits).any(), "NaN values in logits"
+            y = torch.nn.functional.interpolate(logits, size=rgb_pixel_values.shape[2:], mode="bilinear", align_corners=False)
+            
+            
+            # # fuse logits from x and y 
+            combined_embeddings = torch.cat([x, y], dim=1) # concatenate along the channel dimension so descriptors are combined
+            # print(combined_embeddings.shape)
+            z = self.fusion_classifier(combined_embeddings)
+            # print(z.shape)
+            return x, y, z
+
+      
+        
+        def __double_conv(self, in_channels, out_channels):
+            conv = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True)
+            )
+            return conv
+        
+        def log_cf(self, result_cf, step_type):
+            
+            confusion_matrix_computed = result_cf.detach().cpu().numpy()
+            df_cm = pd.DataFrame(confusion_matrix_computed)
+            plt.figure(figsize = (50,45))
+            fig_ = sns.heatmap(df_cm, annot=True, cmap='Spectral').get_figure()
+            plt.close(fig_)
+            self.loggers[0].experiment.add_figure(f"Confusion Matrix {step_type}", fig_, self.current_epoch)
+            
+        def log_data(self, step_type, logits, labels, loss):
+            
+            preds = torch.argmax(logits, dim=1)
+            
+            if step_type == "train":
+                # result_cf = self.train_confusion_matrix(preds, labels) # not used in training loop
+                result_miou = self.train_miou(preds, labels)
+                result_acc_overall = self.train_acc_overall(preds, labels)
+                results_acc_mean = self.train_acc_mean(preds, labels)
+            elif step_type == "val":
+                # result_cf = self.val_confusion_matrix(preds, labels)
+                result_miou = self.val_miou(preds, labels)
+                result_acc_overall = self.val_acc_overall(preds, labels)
+                results_acc_mean = self.val_acc_mean(preds, labels)
+                # self.log_cf(result_cf, step_type)
+            elif step_type == "test":
+                # result_cf = self.test_confusion_matrix(preds, labels)
+                result_miou = self.test_miou(preds, labels)
+                result_acc_overall = self.test_acc_overall(preds, labels)
+                results_acc_mean = self.test_acc_mean(preds, labels)
+                # self.log_cf(result_cf, step_type)
+            else:
+                raise ValueError("step_type must be one of 'train', 'val', or 'test'")
+            
+            self.log(f"{step_type}_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"{step_type}_accuracy_overall", result_acc_overall, on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"{step_type}_accuracy_mean", results_acc_mean, on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"{step_type}_miou", result_miou, on_step=False, on_epoch=True, prog_bar=True)
+
+
+        
+        def training_step(self, batch, batch_idx):
+            
+            step_type = "train"
+            rgb_pixel_values = batch["rgb_pixel_values"]
+            hsi_pixel_values = batch["hsi_pixel_values"]
+            labels = batch["labels"]     
+            
+            logits_hsi, logits_rgb, logits_fused = self.forward(hsi_pixel_values,rgb_pixel_values)
+            loss_hsi = self.loss_fn(logits_hsi, labels) 
+            loss_rgb = self.loss_fn(logits_rgb, labels)
+            loss_fused = self.loss_fn(logits_fused, labels)
+       
+            combined_loss = loss_hsi + loss_rgb + 4*loss_fused # penalize fused loss a lot more since it is final output
+            
+            
+            self.log_data(step_type, logits_fused, labels, combined_loss)
+
+            
+            return combined_loss
+        
+        def test_step(self, batch, batch_idx):
+            
+            step_type = "test"
+            
+            rgb_pixel_values = batch["rgb_pixel_values"]
+            hsi_pixel_values = batch["hsi_pixel_values"]
+            labels = batch["labels"]     
+            
+            logits_hsi, logits_rgb, logits_fused  = self.forward(hsi_pixel_values,rgb_pixel_values)
+            loss_hsi = self.loss_fn(logits_hsi, labels) 
+            loss_rgb = self.loss_fn(logits_rgb, labels)
+            loss_fused = self.loss_fn(logits_fused, labels)
+       
+            combined_loss = loss_hsi + loss_rgb + 4*loss_fused
+            
+            
+            self.log_data(step_type, logits_fused, labels, combined_loss)
+
+            
+            return combined_loss
+        
+        def validation_step(self, batch, batch_idx):
+            
+            step_type = "val"
+            
+            rgb_pixel_values = batch["rgb_pixel_values"]
+            hsi_pixel_values = batch["hsi_pixel_values"]
+            labels = batch["labels"]     
+            
+            logits_hsi, logits_rgb, logits_fused = self.forward(hsi_pixel_values,rgb_pixel_values)
+            loss_hsi = self.loss_fn(logits_hsi, labels) 
+            loss_rgb = self.loss_fn(logits_rgb, labels)
+            loss_fused = self.loss_fn(logits_fused, labels)
+       
+            combined_loss = loss_hsi + loss_rgb + 4*loss_fused
+            
+            
+            self.log_data(step_type, logits_fused, labels, combined_loss)
+
+            
+            return combined_loss
+        
+        
+        def configure_optimizers(self):
+            optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
+            # return optimizer
+            scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10)
+            return {
+            'optimizer': optimizer,
+            "lr_scheduler": scheduler
+             }       
    
 def collate_fn(inputs):
 
@@ -350,23 +614,31 @@ def collate_fn(inputs):
     return batch
 
 
-torch.cuda.empty_cache()
-
-
-# these should be multiple of 14
+dataset_dir='/workspaces/LIB-HSI'
+rgb_data_json = '/workspaces/dinov2/notebooks/lib_hsi_rgb.json'
+batch_size = 2
+ignore_index=-1
+num_workers = 4 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
+initial_lr = 0.0001 
+# these should be multiple of 14 for dino model 
 img_height = 448
 img_width = 448
+
+
+torch.cuda.empty_cache()
+
+if torch.cuda.is_available():
+    device_id = torch.cuda.current_device()
+    gpu_properties = torch.cuda.get_device_properties(device_id)
+    total_vram = gpu_properties.total_memory / 1e9  # Convert bytes to GB
+    print(f"Total VRAM on device: {total_vram:.2f} GB")
+else:
+    print("CUDA is not available. Check if GPU is available or if PyTorch is installed with CUDA.")
+
 test_transform = A.Compose([
     A.Resize(width=img_width, height=img_height), # dinov2 has a patch descriptor size for 14x14 pixels, so we need to resize the image to a multiple of 14. This will also affect the tokens. divide dimensions by 14 and set to dimensions of tokens, larger resolutions will lead to better performance
 ])
 
-
-dataset_dir='/workspaces/LIB-HSI'
-rgb_data_json = '/workspaces/dinov2/notebooks/lib_hsi_rgb.json'
-batch_size = 4
-ignore_index=-1
-num_workers = 4 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
-initial_lr = 0.0001 
 
 file_data =  open(rgb_data_json)
 file_contents = json.load(file_data)
@@ -382,26 +654,22 @@ for i, item in enumerate(file_contents['items'], start=0):
 num_classes = len(id2label)
 # print("num classes",num_classes)
 
-
 train_dataset = LIBHSIDataset(image_set="train", root_dir=dataset_dir, id2color=id2color, transform=test_transform)
 
 test_dataset = LIBHSIDataset(image_set="test", root_dir=dataset_dir, id2color=id2color,  transform=test_transform)
 
 val_dataset = LIBHSIDataset(image_set="validation", root_dir=dataset_dir, id2color=id2color, transform=test_transform)
 
-if torch.cuda.is_available():
-    device_id = torch.cuda.current_device()
-    gpu_properties = torch.cuda.get_device_properties(device_id)
-    total_vram = gpu_properties.total_memory / 1e9  # Convert bytes to GB
-    print(f"Total VRAM on device: {total_vram:.2f} GB")
-else:
-    print("CUDA is not available. Check if GPU is available or if PyTorch is installed with CUDA.")
 
+# model = DinoV2SemanticSegmentation(num_classes=num_classes, repo_name="facebookresearch/dinov2", model_name="dinov2_vitb14_reg", half_precision=False, tokenW=img_width//14, tokenH=img_height//14, learning_rate=initial_lr, ignore_index=ignore_index)
 
-model = DinoV2SemanticSegmentation(num_classes=num_classes, repo_name="facebookresearch/dinov2", model_name="dinov2_vitb14_reg", half_precision=False, tokenW=img_width//14, tokenH=img_height//14, learning_rate=initial_lr, ignore_index=ignore_index)
+model = UNET_SemanticSegmentation(num_classes=num_classes, repo_name="facebookresearch/dinov2", model_name="dinov2_vitb14_reg", half_precision=False, tokenW=img_width//14, tokenH=img_height//14, learning_rate=initial_lr, ignore_index=ignore_index, num_channels=204)
+
 
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,num_workers=num_workers)
-val_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn,num_workers=num_workers)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn,num_workers=num_workers)
+
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn,num_workers=num_workers)
 
 
 checkpoint_callback_val_loss = ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1, filename="lowest_val_loss_hsi")
@@ -410,24 +678,28 @@ checkpoint_callback_last_epoch = ModelCheckpoint(monitor="epoch", mode="max", sa
 
 trainer = L.Trainer(max_epochs=100, callbacks=[EarlyStopping(monitor="val_loss", mode="min", verbose=True), checkpoint_callback_val_loss,checkpoint_callback_last_epoch ])
 
-trainer.fit(model, train_dataloader,  val_dataloader)
+# below trains the model 
+# trainer.fit(model, train_dataloader,  val_dataloader)
 
 
 # # Load the model from a checkpoint
-# model = DinoV2SemanticSegmentation.load_from_checkpoint("lightning_logs/version_7/checkpoints/epoch=81-step=656.ckpt")
-# model.eval()
+# model = DinoV2SemanticSegmentation.load_from_checkpoint("lightning_logs/version_8/checkpoints/last_epoch_hsi.ckpt")
+model = UNET_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_35/checkpoints/lowest_val_loss_hsi.ckpt")
+model.eval()
+# # test the model on the test set
+trainer.test(model, dataloaders=test_dataloader)
+
+
 
 # # perform inference on a sample image 
 # batch = dict()
-# batch["pixel_values"] = train_dataset[0][0].unsqueeze(0)
-# batch["labels"] = train_dataset[0][1].unsqueeze(0)
-
-# test_img = batch["pixel_values"] #torch.as_tensor(batch["pixel_values"])
-# # print(train_dataset[0])
+# batch["hsi_pixel_values"] = test_dataset[0][0].unsqueeze(0)
+# batch["rgb_pixel_values"] = test_dataset[0][1].unsqueeze(0)
+# batch["labels"] = test_dataset[0][2].unsqueeze(0)
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # with torch.no_grad():
-#     results = model(test_img.to(device))
+#     results = model(batch["hsi_pixel_values"].to(device), batch["rgb_pixel_values"].to(device))
 # preds = torch.argmax(results, dim=1)
 
 
@@ -439,3 +711,17 @@ trainer.fit(model, train_dataloader,  val_dataloader)
 # plt.imshow(batch["labels"][0].cpu().numpy(), cmap=cmap)
 # plt.colorbar()
 # plt.show()
+
+
+# dinov2 with linear classifier layer results 
+#    test_accuracy_mean       0.15635395050048828
+#   test_accuracy_overall     0.42304956912994385
+#         test_loss           1.9061671495437622
+#         test_miou           0.04097169265151024
+
+
+# dinov2 rgb, unet hyperspectral 
+#  test_accuracy_mean       0.21615122258663177
+#   test_accuracy_overall     0.5492959022521973
+#         test_loss           10.959273338317871
+#         test_miou           0.06808633357286453
