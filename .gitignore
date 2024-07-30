@@ -16,3 +16,5 @@ dist/
 
 **/freiburg_forest_annotated/*
 **/lightning_logs/*
+
+*.ckpt

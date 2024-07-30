@@ -42,7 +42,19 @@ RUN pip install \
 
 RUN apt install -y \
     libgl1-mesa-glx \
-    gdal-bin 
+    gdal-bin
+    
+RUN pip install \
+    lightning \
+    tensorboard \
+    torch-tb-profiler \
+    pandas \
+    matplotlib \
+    seaborn 
+
+RUN pip install --upgrade torchmetrics 
+
+RUN apt-get install -y python3-tk
 
 RUN useradd -m dino_user 
 
