@@ -1,8 +1,9 @@
 # build command  docker build -t dino2_docker .  
 
-FROM nvidia/cuda:12.5.0-devel-ubuntu22.04
+# FROM nvidia/cuda:12.5.0-devel-ubuntu22.04
+FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
 
-ENV DEBIAN_FRONTEND noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt update
 RUN apt upgrade -y
@@ -55,6 +56,8 @@ RUN pip install \
 RUN pip install --upgrade torchmetrics 
 
 RUN apt-get install -y python3-tk
+
+RUN pip install segmentation-models-pytorch 
 
 RUN useradd -m dino_user 
 

@@ -6,7 +6,7 @@
 
     "mounts":[
         "source=${localWorkspaceFolder}/../../HyperWorkspace/HyperImages/LIB-HSI,target=/workspaces/LIB-HSI,type=bind,consistency=cached",
-        "source=${localWorkspaceFolder}/../../HyperWorkspace/HyperImages/hyper_city,target=/workspaces/hyper_city,type=bind,consistency=cached"
+        "source=${localWorkspaceFolder}/../../HyperWorkspace/HyperImages/hyper_city2,target=/workspaces/hyper_city2,type=bind,consistency=cached"
 
     ],
 
