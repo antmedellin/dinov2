@@ -34,6 +34,9 @@ import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.losses import JaccardLoss
 # pip install segmentation-models-pytorch
 
+import models
+from models import UNET_SemanticSegmentation, DINOv2_SemanticSegmentation, ViT_SemanticSegmentation, visualize_attention_map, visualize_segmentation
+
 # tensorboard --logdir=./lightning_logs/
 # ctrl shft p -> Python: Launch Tensorboard  select lightning logs
   
@@ -100,20 +103,7 @@ def GDAL_imreadmulti(file_name):
     else:
       print("GDAL Error: ", gdal.GetLastErrorMsg())
       return False, []
-   
-class CombinedLoss(nn.Module):
-    def __init__(self, ignore_index=0):
-        super(CombinedLoss, self).__init__()
-        self.cross_entropy_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
-        # self.dice_loss = DiceLoss()
-        self.JaccardLoss = JaccardLoss(mode="multiclass")
-        
-
-    def forward(self, logits, targets):
-        ce_loss = self.cross_entropy_loss(logits, targets)
-        jaccard_loss = self.JaccardLoss(logits, targets)
-        return ce_loss + jaccard_loss # assumes equal weighting of both losses
-    
+     
 class LIBHSIDataset(Dataset):
     def __init__(self, image_set,  root_dir, id2color, transform=None):
         
@@ -130,9 +120,9 @@ class LIBHSIDataset(Dataset):
         self.img_names = [f for f in os.listdir(self.img_dir) if f.endswith('.' + 'dat')]
         self.num_images = len( self.img_names  ) 
 
-        assert self.num_images == len(os.listdir(self.label_dir))
+        assert self.num_images == len( [f for f in os.listdir(self.label_dir) if f.endswith('.' + 'png')])
         
-        self.img_labels = [f for f in os.listdir(self.label_dir)]
+        self.img_labels = [f for f in os.listdir(self.label_dir) if f.endswith('.' + 'png')]
         
         # sort img_names and img_labels
         self.img_names.sort()
@@ -189,196 +179,14 @@ class LIBHSIDataset(Dataset):
             
         return hsi_img, rgb_img, label_img_greyscale   
     
-def collate_fn(inputs):
-
-    batch = dict()
-    batch["hsi_pixel_values"] = torch.stack([i[0] for i in inputs], dim=0)
-    batch["rgb_pixel_values"] = torch.stack([i[1] for i in inputs], dim=0)
-    batch["labels"] = torch.stack([i[2] for i in inputs], dim=0).long()
-
-    return batch   
-    
-class UNET_SemanticSegmentation(L.LightningModule):
-        def __init__(self, num_classes, learning_rate = 1e-3, ignore_index=0 ,num_channels=204, num_workers=4, train_dataset=None, val_dataset=None, test_dataset = None, batch_size=2 ):
-            super().__init__()
-            
-            self.learning_rate = learning_rate
-            # self.batch_size = batch_size override in dataloaders
-            self.ignore_index = ignore_index
-            self.num_workers = num_workers
-            self.num_classes = num_classes
-            self.num_channels = num_channels
-            self.train_dataset = train_dataset
-            self.val_dataset = val_dataset
-            self.test_dataset = test_dataset
-            
-            self.save_hyperparameters()
-            
-            self.loss_fn = CombinedLoss(ignore_index=self.ignore_index)
-            
-            self.hsi_unet = smp.Unet( 'resnet152', in_channels=self.num_channels, classes=self.num_classes, encoder_depth=5)
-
-            self.train_miou = MeanIoU(num_classes=self.num_classes, per_class=False)
-            self.test_miou = MeanIoU(num_classes=self.num_classes, per_class=False)
-            self.val_miou = MeanIoU(num_classes=self.num_classes, per_class=False)
-            
-            self.train_confusion_matrix = MulticlassConfusionMatrix(num_classes=self.num_classes, normalize="true", ignore_index=self.ignore_index)
-            self.val_confusion_matrix = MulticlassConfusionMatrix(num_classes=self.num_classes, normalize="true", ignore_index=self.ignore_index)
-            self.test_confusion_matrix = MulticlassConfusionMatrix(num_classes=self.num_classes, normalize="true", ignore_index=self.ignore_index)
-            
-            #  Calculate statistics for each label and average them
-            self.train_acc_mean = MulticlassAccuracy(num_classes=self.num_classes, average="macro", ignore_index=self.ignore_index)
-            self.val_acc_mean = MulticlassAccuracy(num_classes=self.num_classes, average="macro", ignore_index=self.ignore_index)
-            self.test_acc_mean = MulticlassAccuracy(num_classes=self.num_classes, average="macro", ignore_index=self.ignore_index)
-            
-            #  Sum statistics over all labels
-            self.train_acc_overall = MulticlassAccuracy(num_classes=self.num_classes, average="micro", ignore_index=self.ignore_index)
-            self.val_acc_overall = MulticlassAccuracy(num_classes=self.num_classes, average="micro", ignore_index=self.ignore_index)
-            self.test_acc_overall = MulticlassAccuracy(num_classes=self.num_classes, average="micro", ignore_index=self.ignore_index)
-        
-        def forward(self, hsi_pixel_values, rgb_pixel_values):
-            
-            x = self.hsi_unet(hsi_pixel_values)
-            
-            return x
-        
-        def log_cf(self, result_cf, step_type):
-            
-            confusion_matrix_computed = result_cf.detach().cpu().numpy()
-            df_cm = pd.DataFrame(confusion_matrix_computed)
-            plt.figure(figsize = (self.num_classes+5,self.num_classes))
-            fig_ = sns.heatmap(df_cm, annot=True, cmap='Spectral').get_figure()
-            plt.close(fig_)
-            self.loggers[0].experiment.add_figure(f"Confusion Matrix {step_type}", fig_, self.current_epoch)
-        
-        def log_data(self, step_type, logits, labels, loss):
-            
-            preds = torch.argmax(logits, dim=1)
-            
-            # Check the shapes of preds and labels
-            # print(f"Shape of preds: {preds.shape}, dtype: {preds.dtype}")
-            # print(f"Shape of labels: {labels.shape}, dtype: {labels.dtype}")
-            
-            assert preds.shape == labels.shape, "Predictions and labels must have the same shape"
-            # Check for NaNs or Infs
-            if torch.isnan(preds).any() or torch.isinf(preds).any():
-                raise ValueError("preds contain NaNs or Infs")
-            if torch.isnan(labels).any() or torch.isinf(labels).any():
-                raise ValueError("labels contain NaNs or Infs")
-            
-            # Check unique values
-            # print(f"Unique values in preds: {torch.unique(preds)}")
-            # print(f"Unique values in labels: {torch.unique(labels)}")
-
-            # Check number of classes
-            # num_classes_preds = len(torch.unique(preds))
-            # num_classes_labels = len(torch.unique(labels))
-            # print(f"Number of classes in preds: {num_classes_preds}")
-            # print(f"Number of classes in labels: {num_classes_labels}")
-            
-            # Ensure preds has the correct number of classes
-            # if num_classes_preds != self.train_miou.num_classes:
-            #     raise ValueError(f"Number of classes in preds ({num_classes_preds}) does not match expected ({self.train_miou.num_classes})")
-
-    
-            
-            if step_type == "train":
-                # result_cf = self.train_confusion_matrix(preds, labels) # not used in training loop
-                result_miou = self.train_miou(preds, labels)
-                result_acc_overall = self.train_acc_overall(preds, labels)
-                results_acc_mean = self.train_acc_mean(preds, labels)
-                # print("train", result_miou, result_acc_overall, results_acc_mean)
-            elif step_type == "val":
-                # result_cf = self.val_confusion_matrix(preds, labels)
-                result_miou = self.val_miou(preds, labels)
-                result_acc_overall = self.val_acc_overall(preds, labels)
-                results_acc_mean = self.val_acc_mean(preds, labels)
-                # self.log_cf(result_cf, step_type)
-            elif step_type == "test":
-                result_cf = self.test_confusion_matrix(preds, labels)
-                result_miou = self.test_miou(preds, labels)
-                result_acc_overall = self.test_acc_overall(preds, labels)
-                results_acc_mean = self.test_acc_mean(preds, labels)
-                self.log_cf(result_cf, step_type)
-            else:
-                raise ValueError("step_type must be one of 'train', 'val', or 'test'")
-            
-            self.log(f"{step_type}_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-            self.log(f"{step_type}_accuracy_overall", result_acc_overall, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-            self.log(f"{step_type}_accuracy_mean", results_acc_mean, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-            self.log(f"{step_type}_miou", result_miou, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-
-        def training_step(self, batch, batch_idx):
-            
-            step_type = "train"
-            rgb_pixel_values = batch["rgb_pixel_values"]
-            hsi_pixel_values = batch["hsi_pixel_values"]
-            labels = batch["labels"]     
-            
-            logits_hsi = self.forward(hsi_pixel_values,rgb_pixel_values)
-            loss_hsi = self.loss_fn(logits_hsi, labels) 
-            
-            self.log_data(step_type, logits_hsi, labels, loss_hsi)
-
-            return loss_hsi
-        
-        def test_step(self, batch, batch_idx):
-            
-            step_type = "test"
-            rgb_pixel_values = batch["rgb_pixel_values"]
-            hsi_pixel_values = batch["hsi_pixel_values"]
-            labels = batch["labels"]     
-            
-            logits_hsi = self.forward(hsi_pixel_values,rgb_pixel_values)
-            loss_hsi = self.loss_fn(logits_hsi, labels) 
-            
-            self.log_data(step_type, logits_hsi, labels, loss_hsi)
-
-            return loss_hsi
-        
-        def validation_step(self, batch, batch_idx):
-                
-            step_type = "val"
-            rgb_pixel_values = batch["rgb_pixel_values"]
-            hsi_pixel_values = batch["hsi_pixel_values"]
-            labels = batch["labels"]     
-            
-            logits_hsi = self.forward(hsi_pixel_values,rgb_pixel_values)
-            loss_hsi = self.loss_fn(logits_hsi, labels) 
-            
-            self.log_data(step_type, logits_hsi, labels, loss_hsi)
-
-            return loss_hsi
-        
-        def configure_optimizers(self):
-            optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
-            # return optimizer
-            scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10)
-            return {
-            'optimizer': optimizer,
-            "lr_scheduler": scheduler
-             }     
-              
-        def train_dataloader(self):
-            
-            return  DataLoader(self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, collate_fn=collate_fn,num_workers=self.num_workers)
-        
-        def val_dataloader(self):
-            
-            return  DataLoader(self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, collate_fn=collate_fn,num_workers=self.num_workers)
-        
-        def test_dataloader(self):
-            
-            return  DataLoader(self.test_dataset, batch_size=self.hparams.batch_size, shuffle=False, collate_fn=collate_fn,num_workers=self.num_workers)
-
 
 dataset_dir='/workspaces/LIB-HSI'
 rgb_data_json = '/workspaces/dinov2/notebooks/lib_hsi_rgb.json'
 
-batch_size = 2
+batch_size = 1
 # ignore_index=0 #-1
-ignore_index=7 # misc. class, 
-num_workers = 3 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
+ignore_index=2 # misc. class, 
+num_workers = 4 #  os.cpu_count() or 1  # Fallback to 1 if os.cpu_count() is None
 initial_lr =  0.0001 #0.00001 
 swa_lr = 0.01
 # these should be multiple of 14 for dino model 
@@ -387,8 +195,8 @@ img_width = 448
 max_num_epochs = 100
 accumulate_grad_batches = 5# 5 # increases the effective batch size  # 1 means no accumulation # more important when batch size is small or not doing multi gpu training
 grad_clip_val = 5 # clip gradients that have norm bigger than this
-training_model = True
-tuning_model = True
+training_model = False
+tuning_model = False
 min_epochs = 20
 
 # Define mean and standard deviation for normalization
@@ -400,7 +208,7 @@ std = [0.225] * num_channels
 torch.cuda.empty_cache()
 
 test_transform = A.Compose([
-    # A.Resize(width=img_width, height=img_height), 
+    A.Resize(width=img_width, height=img_height), 
     A.Normalize(mean=mean, std=std, max_pixel_value=255.0)
 
 ], additional_targets={"hsi_image": "image"})
@@ -409,7 +217,7 @@ train_transform = A.Compose([
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.5),
     # A.RandomCrop(width=450, height=450),
-    # A.Resize(width=img_width, height=img_height), 
+    A.Resize(width=img_width, height=img_height), 
     A.Normalize(mean=mean, std=std, max_pixel_value=255.0)
 ], additional_targets={"hsi_image": "image"})
 
@@ -432,13 +240,29 @@ train_dataset = LIBHSIDataset(image_set="train", root_dir=dataset_dir, id2color=
 test_dataset = LIBHSIDataset(image_set="test", root_dir=dataset_dir, id2color=id2color,  transform=test_transform)
 val_dataset = LIBHSIDataset(image_set="validation", root_dir=dataset_dir, id2color=id2color, transform=test_transform)
 
-model = UNET_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size)
+# model = UNET_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size)
+
+
+# model = DINOv2_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size)
+
+
+model = ViT_SemanticSegmentation(num_classes=num_classes,learning_rate=initial_lr, ignore_index=ignore_index, num_channels= num_channels, num_workers=num_workers,  train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset, batch_size=batch_size)
+
+
+
 
 checkpoint_callback_val_loss = ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1, filename="lowest_val_loss_hsi")
 checkpoint_callback_val_miou = ModelCheckpoint(monitor="val_miou", mode="max", save_top_k=1, filename="best_val_miou_hsi")
 checkpoint_callback_last_epoch = ModelCheckpoint(monitor="epoch", mode="max", save_top_k=1, filename="last_epoch_hsi")
 
-trainer = L.Trainer(max_epochs=max_num_epochs, accumulate_grad_batches=accumulate_grad_batches, callbacks=[EarlyStopping(monitor="val_loss", mode="min", verbose=True, patience=5), checkpoint_callback_val_loss,checkpoint_callback_last_epoch ,  checkpoint_callback_val_miou, StochasticWeightAveraging(swa_lrs=swa_lr) ], accelerator="gpu", devices="auto", gradient_clip_val=grad_clip_val, ) 
+
+
+
+# Set the float32 matmul precision to 'medium' or 'high'
+torch.set_float32_matmul_precision('medium')
+
+
+trainer = L.Trainer(max_epochs=max_num_epochs, accumulate_grad_batches=accumulate_grad_batches, callbacks=[EarlyStopping(monitor="val_loss", mode="min", verbose=True, patience=5), checkpoint_callback_val_loss,checkpoint_callback_last_epoch ,  checkpoint_callback_val_miou, StochasticWeightAveraging(swa_lrs=swa_lr) ], accelerator="gpu", devices="auto", gradient_clip_val=grad_clip_val, precision="16-mixed" ) 
 
 if training_model == True: 
     
@@ -467,6 +291,74 @@ if training_model == True:
     trainer.fit(model)
 
 # model = UNET_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_60/checkpoints/lowest_val_loss_hsi.ckpt")
+# model.eval()
+# # test the model on the test set
+# trainer.test(model)
+
+
+
+
+
+# not sure if below is implemented correctly
+model = ViT_SemanticSegmentation.load_from_checkpoint("lightning_logs/version_49/checkpoints/lowest_val_loss_hsi.ckpt")
 model.eval()
-# test the model on the test set
-trainer.test(model)
+
+# Test the model on the test set 
+# test_results = trainer.test(model)
+
+
+
+# Assuming you have a test dataset and dataloader
+test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
+# Get a sample from the test set
+sample = next(iter(test_dataloader))
+hsi_pixel_values, rgb_pixel_values, ground_truth_labels = sample[0], sample[1], sample[2]
+
+# Determine the device of the model
+device = next(model.parameters()).device
+
+# Move the input tensors to the same device as the model
+hsi_pixel_values = hsi_pixel_values.to(device)
+rgb_pixel_values = rgb_pixel_values.to(device)
+ground_truth_labels = ground_truth_labels.to(device)
+
+# Forward pass to get the predictions
+with torch.no_grad():
+    predictions, _ = model(hsi_pixel_values, rgb_pixel_values)
+
+
+
+
+# Visualize the segmentation results
+visualize_segmentation(predictions, ground_truth_labels, rgb_pixel_values[0], num_classes)
+
+
+
+# trying to get attention maps below
+
+# # Assuming you have a test dataset and dataloader
+# test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
+# # Get a sample from the test set
+# sample = next(iter(test_dataloader))
+# hsi_pixel_values, rgb_pixel_values = sample[0], sample[1]
+
+
+# # Determine the device of the model
+# device = next(model.parameters()).device
+
+# # Move the input tensors to the same device as the model
+# hsi_pixel_values = hsi_pixel_values.to(device)
+# rgb_pixel_values = rgb_pixel_values.to(device)
+
+# # Forward pass to get the attention weights
+# output, attn_weights_all = model(hsi_pixel_values, rgb_pixel_values)
+
+
+# # Print the type and shape of each element in attn_weights_all
+# for i, attn_weights in enumerate(attn_weights_all):
+#     print(f"Layer {i}: Type: {type(attn_weights)}, Shape: {attn_weights.shape}, Min: {attn_weights.min()}, Max: {attn_weights.max()}")
+
+# # Visualize the attention map for the first layer and first head
+# visualize_attention_map(attn_weights_all, rgb_pixel_values[0], layer_idx=-1, head_idx=-1)
